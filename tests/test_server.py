@@ -52,6 +52,33 @@ def test_status_not_authenticated(monkeypatch, clean_env):
     assert "authenticated" in res["readiness_detail"]
 
 
+def test_capability_summary_covers_all_task_families():
+    """First-read instructions name every task family + prereqs + negative scope (issue #7)."""
+    summary = server.CAPABILITY_SUMMARY
+    # The server advertises this string to clients as FastMCP `instructions`.
+    assert server.mcp.instructions == summary
+    for tool in (
+        "codex_consult",
+        "codex_review_changes",
+        "codex_delegate",
+        "codex_delegate_async",
+        "codex_job_status",  # the codex_job_* lifecycle family (first entry, full name)
+        "codex_status",
+    ):
+        assert tool in summary, tool
+    # The job shorthand must use real tool suffixes — `consume_result`, not `consume`
+    # (there is no `codex_job_consume`), so an agent never derives a nonexistent name.
+    assert "consume_result" in summary
+    assert "/consume/" not in summary  # the wrong shorthand
+    # Prerequisite + negative scope are stated, not just the tool list.
+    low = summary.lower()
+    assert "codex_status" in summary and "first" in low  # run codex_status first
+    assert "verify" in low  # treat findings as claims to verify
+    assert "working tree" in low or "working_tree" in low  # delegate doesn't edit it
+    assert "sandbox" in low  # negative scope: no sandbox bypass
+    assert "approval" in low  # negative scope: no approval bypass
+
+
 def test_capabilities_shape():
     res = server.codex_capabilities()
     assert res["ok"] is True
