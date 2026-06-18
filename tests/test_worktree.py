@@ -33,6 +33,32 @@ def test_create_and_remove(repo):
     assert not Path(wt.path).exists()
 
 
+def test_create_reports_parent_early(repo):
+    # The on_parent hook fires as soon as the temp parent exists, so a caller can
+    # record it for cleanup even if the worker is hard-killed mid-create.
+    seen: list[str] = []
+    wt = worktree.create(str(repo), timeout=30, on_parent=seen.append)
+    try:
+        assert seen == [wt.parent]
+        assert Path(wt.parent).is_dir()
+    finally:
+        worktree.remove(str(repo), wt, timeout=30)
+
+
+def test_create_cleans_temp_parent_if_on_parent_raises(repo):
+    # If the on_parent hook raises (e.g. disk-full writing the manifest), the temp
+    # parent must not leak — that is the very leak this hook exists to prevent.
+    seen: list[str] = []
+
+    def boom(parent):
+        seen.append(parent)
+        raise RuntimeError("disk full")
+
+    with pytest.raises(RuntimeError):
+        worktree.create(str(repo), timeout=30, on_parent=boom)
+    assert seen and not Path(seen[0]).exists()
+
+
 def test_seeds_uncommitted_tracked_changes(repo):
     (repo / "a.py").write_text("x = 2\n")  # uncommitted change in live tree
     wt = worktree.create(str(repo), timeout=30)
