@@ -40,4 +40,7 @@ Bump together: `pyproject.toml` version, `.claude-plugin/plugin.json`, the `@vX.
 
 - Conventional commits (`feat:`, `fix:`, `chore:`, …).
 - Branch for feature work; do not commit directly to the default branch.
-- Don't add `pull_request_target` workflows or self-approve reviews.
+- **Agents never merge PRs; the maintainer merges.** An agent may merge only on an explicit,
+  in-session instruction to merge that specific PR. Open the PR, get checks green, and stop.
+- Don't add `pull_request_target` workflows or self-approve reviews. After pushing new commits to a
+  PR that was already reviewed, request fresh review rather than relying on the stale approval.

@@ -9,6 +9,15 @@ dist/
 # Environments
 .venv/
 .env
+.env.*
+
+# Secrets / credentials (never commit)
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+*_credentials.json
 
 # Tooling caches
 .ruff_cache/
