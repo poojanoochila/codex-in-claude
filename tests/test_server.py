@@ -529,3 +529,123 @@ async def test_delegate_async_input_too_large(monkeypatch, clean_env, tmp_path):
     res = await server.codex_delegate_async("z" * 2000, workspace_root=str(tmp_path))
     assert res["ok"] is False
     assert res["error"]["code"] == "input_too_large"
+
+
+async def test_job_status_done(monkeypatch, clean_env, tmp_path):
+    store = _FakeStore(status_dict=_ok_record("done"))
+    monkeypatch.setattr(server.config, "job_store", lambda: store)
+    res = await server.codex_job_status("job-abc", workspace_root=str(tmp_path))
+    assert res["ok"] is True
+    assert res["job_id"] == "job-abc"
+    assert res["status"] == "done"
+    assert res["result_available"] is True
+
+
+async def test_job_status_not_found(monkeypatch, clean_env, tmp_path):
+    store = _FakeStore(status_dict=None)
+    monkeypatch.setattr(server.config, "job_store", lambda: store)
+    res = await server.codex_job_status("nope", workspace_root=str(tmp_path))
+    assert res["ok"] is False
+    assert res["error"]["code"] == "job_not_found"
+
+
+async def test_job_status_invalid_workspace(clean_env):
+    res = await server.codex_job_status("x", workspace_root="relative")
+    assert res["ok"] is False
+    assert res["error"]["code"] == "invalid_workspace_root"
+
+
+async def test_job_result_done_patches_job_id(monkeypatch, clean_env, tmp_path):
+    store = _FakeStore(record=_ok_record("done"), result_json=_done_envelope())
+    monkeypatch.setattr(server.config, "job_store", lambda: store)
+    res = await server.codex_job_result("job-abc", workspace_root=str(tmp_path))
+    assert res["ok"] is True
+    assert res["meta"]["job_id"] == "job-abc"
+    assert res["summary"] == "did it"
+
+
+async def test_job_result_running_maps_error(monkeypatch, clean_env, tmp_path):
+    store = _FakeStore(record=_ok_record("running"), result_json=None)
+    monkeypatch.setattr(server.config, "job_store", lambda: store)
+    res = await server.codex_job_result("job-abc", workspace_root=str(tmp_path))
+    assert res["ok"] is False
+    assert res["error"]["code"] == "job_running"
+    assert res["error"]["retryable"] is True
+
+
+async def test_job_result_timeout_maps_error(monkeypatch, clean_env, tmp_path):
+    store = _FakeStore(record=_ok_record("timeout"), result_json=None)
+    monkeypatch.setattr(server.config, "job_store", lambda: store)
+    res = await server.codex_job_result("job-abc", workspace_root=str(tmp_path))
+    assert res["error"]["code"] == "job_timeout"
+
+
+async def test_job_result_done_but_missing_payload(monkeypatch, clean_env, tmp_path):
+    store = _FakeStore(record=_ok_record("done"), result_json=None)
+    monkeypatch.setattr(server.config, "job_store", lambda: store)
+    res = await server.codex_job_result("job-abc", workspace_root=str(tmp_path))
+    assert res["ok"] is False
+    assert res["error"]["code"] == "job_failed"
+
+
+async def test_job_result_not_found(monkeypatch, clean_env, tmp_path):
+    store = _FakeStore(record=None, result_json=None)
+    monkeypatch.setattr(server.config, "job_store", lambda: store)
+    res = await server.codex_job_result("nope", workspace_root=str(tmp_path))
+    assert res["error"]["code"] == "job_not_found"
+
+
+async def test_job_consume_result_passes_consume(monkeypatch, clean_env, tmp_path):
+    store = _FakeStore(record=_ok_record("done"), result_json=_done_envelope())
+    monkeypatch.setattr(server.config, "job_store", lambda: store)
+    res = await server.codex_job_consume_result("job-abc", workspace_root=str(tmp_path))
+    assert res["ok"] is True
+    assert store.consumed == ["job-abc"]
+
+
+async def test_job_cancel(monkeypatch, clean_env, tmp_path):
+    store = _FakeStore(record=_ok_record("cancelled"))
+    monkeypatch.setattr(server.config, "job_store", lambda: store)
+    res = await server.codex_job_cancel("job-abc", workspace_root=str(tmp_path))
+    assert res["ok"] is True
+    assert res["status"] == "cancelled"
+    assert store.cancelled == ["job-abc"]
+
+
+async def test_job_cancel_not_found(monkeypatch, clean_env, tmp_path):
+    store = _FakeStore(record=None)
+    monkeypatch.setattr(server.config, "job_store", lambda: store)
+    res = await server.codex_job_cancel("nope", workspace_root=str(tmp_path))
+    assert res["error"]["code"] == "job_not_found"
+
+
+async def test_job_list(monkeypatch, clean_env, tmp_path):
+    store = _FakeStore(record=_ok_record("done"))
+    monkeypatch.setattr(server.config, "job_store", lambda: store)
+    res = await server.codex_job_list(workspace_root=str(tmp_path))
+    assert res["ok"] is True
+    assert len(res["jobs"]) == 1
+    assert res["jobs"][0]["job_id"] == "job-abc"
+
+
+async def test_job_list_invalid_workspace(clean_env):
+    res = await server.codex_job_list(workspace_root="relative")
+    assert res["ok"] is False
+    assert res["error"]["code"] == "invalid_workspace_root"
+
+
+def test_capabilities_lists_m4_tools():
+    caps = server.codex_capabilities()
+    assert "codex_delegate_async" in caps["active_tools"]
+    for t in (
+        "codex_job_status",
+        "codex_job_result",
+        "codex_job_consume_result",
+        "codex_job_cancel",
+        "codex_job_list",
+    ):
+        assert t in caps["free_tools"]
+
+
+def test_fingerprint_is_schema_1():
+    assert FINGERPRINT == "codex-in-claude/0.1/schema-1"

@@ -11,9 +11,16 @@ agent-visible MCP surface; the result `fingerprint` changes when they do.
   working_tree/branch/commit), `codex_delegate` (propose tier — implements a task in an isolated
   git worktree and returns a reviewable diff that is not applied), plus free `codex_status`,
   `codex_dry_run`, and `codex_capabilities`.
+- Background jobs (M4): `codex_delegate_async` runs the propose tier detached and returns a
+  `job_id` immediately, with free lifecycle tools `codex_job_status`, `codex_job_result`,
+  `codex_job_consume_result`, `codex_job_cancel`, and `codex_job_list`. Job state is disk-backed
+  under the state dir, survives MCP server restarts, reconciles dead workers via PID liveness, and
+  is bounded by a wall-clock deadline plus TTL and per-workspace count-cap eviction.
+- Config knobs: `CODEX_IN_CLAUDE_JOB_TTL`, `CODEX_IN_CLAUDE_JOB_MAX_SECONDS`,
+  `CODEX_IN_CLAUDE_JOB_MAX_COUNT` (alongside the existing `CODEX_IN_CLAUDE_STATE_DIR`).
 - Slash commands: `/codex:status`, `/codex:consult`, `/codex:review`, `/codex:delegate`,
-  `/codex:dry-run`.
+  `/codex:delegate-async`, `/codex:dry-run`.
 - `collaborating-with-codex` guidance skill.
 - Driven by `codex exec` (not the experimental app-server protocol); centralized CLI contract,
   graceful flag gating, secret redaction, and an isolated-worktree delegation workflow.
-- Result fingerprint: `codex-in-claude/0.1/schema-3`.
+- Result fingerprint: `codex-in-claude/0.1/schema-1`.

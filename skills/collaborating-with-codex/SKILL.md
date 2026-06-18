@@ -23,6 +23,7 @@ the user — do not retry the paid tools in a loop.
 | A second opinion / answer on a question or design | `codex_consult` | model call |
 | Codex to review your git changes for bugs | `codex_review_changes` | model call |
 | Codex to implement a task and return a diff | `codex_delegate` | model call |
+| To implement a long task in the background | `codex_delegate_async` | model call |
 | To preview a review's scope/size before spending | `codex_dry_run` | free |
 | Readiness / version / auth | `codex_status` | free |
 | The tool list + result fingerprint | `codex_capabilities` | free |
@@ -41,6 +42,23 @@ the user — do not retry the paid tools in a loop.
 Always pass an absolute `workspace_root` (or rely on the MCP root) so Codex targets
 the intended repository — otherwise the call may resolve to the server's own cwd
 (you'll see `meta.workspace_warning`).
+
+## Background jobs (long delegations)
+
+For a delegation that may take a while, use **codex_delegate_async** instead of
+blocking on `codex_delegate`. It returns a `job_id` immediately and runs detached;
+the result is the same propose-tier envelope (with a `diff`).
+
+- Starting a job **commits to spend** — it runs to completion or its wall-clock
+  deadline even if you never poll.
+- Poll `codex_job_status(job_id)`; **honor `poll_after_ms` and do not poll in a tight
+  loop**. When `result_available` is true, call `codex_job_result(job_id)`.
+- `codex_job_consume_result` reads and deletes the record; `codex_job_cancel` stops a
+  running job; `codex_job_list` recovers `job_id`s lost across context compaction.
+- Job state is disk-backed (survives server restarts) and bounded by a deadline plus
+  TTL/count-cap eviction — old records disappear, so read results before they expire.
+- Pass the same `workspace_root` to the lifecycle tools as you did to the async call;
+  jobs are keyed by workspace.
 
 ## Reading results
 
@@ -80,3 +98,5 @@ Every tool returns an envelope:
 - `timeout_seconds` — per call (clamped 10–600; default 180).
 - Env defaults: `CODEX_IN_CLAUDE_MODEL`, `CODEX_IN_CLAUDE_TIMEOUT_SECONDS`,
   `CODEX_IN_CLAUDE_ISOLATION`, `CODEX_IN_CLAUDE_MAX_INPUT_BYTES`.
+- Background jobs: `CODEX_IN_CLAUDE_STATE_DIR` (record location), `CODEX_IN_CLAUDE_JOB_TTL`,
+  `CODEX_IN_CLAUDE_JOB_MAX_SECONDS` (deadline), `CODEX_IN_CLAUDE_JOB_MAX_COUNT`.

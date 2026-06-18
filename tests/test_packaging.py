@@ -60,3 +60,9 @@ async def test_capabilities_match_registered_tools():
     advertised = set(caps["active_tools"]) | set(caps["free_tools"])
     tool_names = {t.name for t in await server.mcp.list_tools()}
     assert advertised == tool_names
+
+
+def test_delegate_async_command_present():
+    cmd_dir = ROOT / "commands/codex"
+    names = {p.stem for p in cmd_dir.glob("*.md")}
+    assert "delegate-async" in names

@@ -51,15 +51,21 @@ via `uvx` from a pinned release tag, so updates are deliberate.
   `commit`; returns structured findings.
 - `codex_delegate(task, …)` — implement a task in an isolated worktree; returns a reviewable
   `diff` that is **not** applied.
+- `codex_delegate_async(task, …)` — same as `codex_delegate` but detached: returns a `job_id`
+  immediately. Starting a job commits to spend (it runs to completion or its deadline).
 
 **Free (local only):**
 
 - `codex_status` — readiness, version, auth, resolved defaults.
 - `codex_dry_run(scope, …)` — preview a review's scope/diff size/redactions before spending.
 - `codex_capabilities` — tool inventory + result fingerprint.
+- `codex_job_status(job_id, …)` / `codex_job_result` / `codex_job_consume_result` /
+  `codex_job_cancel` / `codex_job_list` — background-job lifecycle. State is disk-backed and
+  survives server restarts; jobs are bounded by a wall-clock deadline with TTL + count-cap
+  eviction. Honor `poll_after_ms`; don't poll in a tight loop.
 
 Slash commands wrap these: `/codex:status`, `/codex:consult`, `/codex:review`,
-`/codex:delegate`, `/codex:dry-run`.
+`/codex:delegate`, `/codex:delegate-async`, `/codex:dry-run`.
 
 ## Safety
 
@@ -80,6 +86,10 @@ Slash commands wrap these: `/codex:status`, `/codex:consult`, `/codex:review`,
 | `CODEX_IN_CLAUDE_ISOLATION` | `inherit` | `inherit` \| `ignore-config` \| `ignore-rules` |
 | `CODEX_IN_CLAUDE_MAX_INPUT_BYTES` | 200000 | cap on prompt/diff bytes |
 | `CODEX_IN_CLAUDE_GIT_TIMEOUT_SECONDS` | 60 | git command timeout |
+| `CODEX_IN_CLAUDE_STATE_DIR` | `$XDG_CACHE_HOME/codex-in-claude/jobs` | disk-backed background-job records |
+| `CODEX_IN_CLAUDE_JOB_TTL` | 86400 | seconds a finished job record is kept (min 60) |
+| `CODEX_IN_CLAUDE_JOB_MAX_SECONDS` | 1800 | background-job wall-clock cap (clamped 60–7200) |
+| `CODEX_IN_CLAUDE_JOB_MAX_COUNT` | 50 | retained jobs per workspace (clamped 1–1000) |
 
 ## Local development
 

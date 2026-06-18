@@ -7,6 +7,7 @@ Tool surface (v1 grows by milestone):
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from typing import Any, cast
 from urllib.parse import unquote, urlparse
@@ -19,7 +20,9 @@ from codex_in_claude.schemas import (
     CAPABILITIES_SCHEMA,
     DRY_RUN_SCHEMA,
     FINDINGS_OUTPUT_SCHEMA,
+    JOB_LIST_SCHEMA,
     JOB_STARTED_SCHEMA,
+    JOB_STATUS_SCHEMA,
     RESULT_SCHEMA,
     STATUS_SCHEMA,
     CapabilitiesResult,
@@ -29,7 +32,10 @@ from codex_in_claude.schemas import (
     ErrorInfo,
     ErrorResult,
     Isolation,
+    JobListResult,
     JobStarted,
+    JobStatus,
+    JobSummary,
     Meta,
     RawDefaults,
     RawResponse,
@@ -239,8 +245,22 @@ def codex_capabilities() -> dict:
         version=__version__,
         transport="stdio",
         stability="alpha",
-        active_tools=["codex_consult", "codex_review_changes", "codex_delegate"],
-        free_tools=["codex_status", "codex_dry_run", "codex_capabilities"],
+        active_tools=[
+            "codex_consult",
+            "codex_review_changes",
+            "codex_delegate",
+            "codex_delegate_async",
+        ],
+        free_tools=[
+            "codex_status",
+            "codex_dry_run",
+            "codex_capabilities",
+            "codex_job_status",
+            "codex_job_result",
+            "codex_job_consume_result",
+            "codex_job_cancel",
+            "codex_job_list",
+        ],
         tool_details=[
             ToolCapability(
                 name="codex_consult",
@@ -271,6 +291,55 @@ def codex_capabilities() -> dict:
                 "unapplied changes plus a summary.",
             ),
             ToolCapability(
+                name="codex_delegate_async",
+                cost="active",
+                use_when="Same as codex_delegate, but the task is long-running and you "
+                "want a job_id immediately instead of blocking.",
+                required_params=["task"],
+                key_optional_params=["workspace_root", "model", "isolation"],
+                returns="A job handle (job_id, status, deadline, ttl). Poll with "
+                "codex_job_status; read with codex_job_result.",
+            ),
+            ToolCapability(
+                name="codex_job_status",
+                cost="free",
+                use_when="To poll a background job's state without fetching the result.",
+                required_params=["job_id"],
+                key_optional_params=["workspace_root"],
+                returns="Status, elapsed time, expiry, and result_available.",
+            ),
+            ToolCapability(
+                name="codex_job_result",
+                cost="free",
+                use_when="When codex_job_status reports result_available=true.",
+                required_params=["job_id"],
+                key_optional_params=["workspace_root"],
+                returns="The same envelope as codex_delegate, with meta.job_id set.",
+            ),
+            ToolCapability(
+                name="codex_job_consume_result",
+                cost="free",
+                use_when="To fetch a finished job's result and delete the stored record.",
+                required_params=["job_id"],
+                key_optional_params=["workspace_root"],
+                returns="The same envelope as codex_job_result; removes completed state.",
+            ),
+            ToolCapability(
+                name="codex_job_cancel",
+                cost="free",
+                use_when="To stop a running background job.",
+                required_params=["job_id"],
+                key_optional_params=["workspace_root"],
+                returns="The job's status after cancellation.",
+            ),
+            ToolCapability(
+                name="codex_job_list",
+                cost="free",
+                use_when="To recover job_ids or inspect known jobs for a workspace.",
+                key_optional_params=["workspace_root"],
+                returns="Compact job summaries, newest first.",
+            ),
+            ToolCapability(
                 name="codex_status",
                 cost="free",
                 use_when="Before active calls, to confirm codex is installed and authenticated.",
@@ -291,6 +360,7 @@ def codex_capabilities() -> dict:
             "Get a second opinion or answer from Codex (read-only).",
             "Review git changes and return structured findings.",
             "Delegate a coding task and get a reviewable worktree diff (not applied).",
+            "Run a long delegate in the background and poll it via job tools.",
         ],
         negative_scope=[
             "Does not apply edits to your working tree (delegate returns a diff).",
@@ -886,6 +956,223 @@ async def codex_dry_run(
         redacted_paths_count=len(diff.redacted_paths),
         redacted_paths=diff.redacted_paths,
     ).model_dump(mode="json")
+
+
+# --------------------------------------------------------------------------- #
+# Background-job lifecycle (free — local job state only, no model call)
+# --------------------------------------------------------------------------- #
+# Non-done job states mapped to the result-envelope error contract.
+_STATE_TO_ERROR: dict[str, tuple[str, str, str]] = {
+    "running": (
+        "job_running",
+        "The job is still running.",
+        "Poll codex_job_status; call codex_job_result once status=done.",
+    ),
+    "cancelled": (
+        "job_cancelled",
+        "The job was cancelled.",
+        "Start a new job; a cancelled run cannot be resumed.",
+    ),
+    "timeout": (
+        "job_timeout",
+        "The job exceeded its wall-clock deadline and was stopped.",
+        "Narrow the task or raise CODEX_IN_CLAUDE_JOB_MAX_SECONDS, then start a new job.",
+    ),
+    "failed": (
+        "job_failed",
+        "The job failed without producing a result.",
+        "Run codex_status to check codex is installed and authenticated, then retry.",
+    ),
+}
+
+
+def _job_meta(cwd: str, source: str | None) -> Meta:
+    """A propose-tier meta for job-lifecycle envelopes (deadline as timeout)."""
+    d = config.defaults()
+    return _base_meta(
+        cwd,
+        source,
+        tier="propose",
+        sandbox="workspace-write",
+        isolation=d.isolation,
+        model=d.model,
+        timeout_seconds=config.job_max_seconds(),
+    )
+
+
+def _job_not_found(job_id: str, meta: Meta) -> dict:
+    return ErrorResult(
+        error=ErrorInfo(
+            code="job_not_found",
+            message=f"No job '{job_id}' in this workspace.",
+            repair="Check the job_id, or start a new job; records expire after the TTL.",
+            offending_param="job_id",
+        ),
+        meta=meta,
+    ).model_dump(mode="json")
+
+
+async def _resolve_job_workspace(
+    ctx: Context | None, workspace_root: str | None
+) -> tuple[str, str | None, dict | None]:
+    """Resolve the workspace for a lifecycle call. Returns (cwd, source, error)."""
+    cwd_guess = workspace.server_cwd()
+    roots = await _roots_from_ctx(ctx)
+    wres = workspace.resolve_workspace(workspace_root, roots, cwd_guess)
+    cwd = wres.path or cwd_guess
+    if wres.error_code is not None:
+        meta = _job_meta(cwd, wres.source)
+        err = ErrorResult(
+            error=ErrorInfo(
+                code=cast("ErrorCode", wres.error_code),
+                message=wres.error_detail or "invalid workspace",
+                repair="Pass an absolute workspace_root inside the client's MCP roots.",
+                offending_param="workspace_root",
+            ),
+            meta=meta,
+        ).model_dump(mode="json")
+        return cwd, wres.source, err
+    return cwd, wres.source, None
+
+
+def _job_status_model(data: dict) -> JobStatus:
+    state = data["status"]
+    mapped = _STATE_TO_ERROR.get(state)
+    detail = mapped[1] if (mapped and state not in ("running", "done")) else None
+    return JobStatus(
+        job_id=data["job_id"],
+        kind=data["kind"],
+        status=data["status"],
+        started_at=data["started_at"],
+        elapsed_ms=data["elapsed_ms"],
+        deadline_seconds=data["deadline_seconds"],
+        poll_after_ms=data["poll_after_ms"],
+        ttl_seconds=data["ttl_seconds"],
+        expires_at=data["expires_at"],
+        result_available=data["result_available"],
+        detail=detail,
+    )
+
+
+@mcp.tool(annotations=_JOB_LIFECYCLE, output_schema=JOB_STATUS_SCHEMA)
+async def codex_job_status(
+    job_id: str, ctx: Context | None = None, workspace_root: str | None = None
+) -> dict:
+    """Check a background job's lifecycle state without fetching the full result.
+
+    Use after codex_delegate_async. Returns status, elapsed time, expiry, and
+    `result_available`; when it is true, call codex_job_result. Free — no model
+    call. Honor `poll_after_ms` between polls; do not poll in a tight loop."""
+    cwd, source, err = await _resolve_job_workspace(ctx, workspace_root)
+    if err is not None:
+        return err
+    store = config.job_store()
+    data = await asyncio.to_thread(store.status, cwd, job_id)
+    if data is None:
+        return _job_not_found(job_id, _job_meta(cwd, source))
+    return _job_status_model(data).model_dump(mode="json")
+
+
+async def _job_result_impl(
+    job_id: str, ctx: Context | None, workspace_root: str | None, *, consume: bool
+) -> dict:
+    cwd, source, err = await _resolve_job_workspace(ctx, workspace_root)
+    if err is not None:
+        return err
+    store = config.job_store()
+    rec, payload = await asyncio.to_thread(store.result_payload, cwd, job_id, consume=consume)
+    meta = _job_meta(cwd, source)
+    if rec is None:
+        return _job_not_found(job_id, meta)
+    state = rec["status"]
+    if state == "done" and payload is not None:
+        # Patch the stored envelope's meta with the job_id so callers can correlate.
+        if isinstance(payload.get("meta"), dict):
+            payload["meta"]["job_id"] = job_id
+        return payload
+    code, message, repair = _STATE_TO_ERROR.get(
+        state, ("job_failed", "The job did not complete.", "Start a new job.")
+    )
+    return ErrorResult(
+        error=ErrorInfo(
+            code=cast("ErrorCode", code),
+            message=message,
+            repair=repair,
+            retryable=state == "running",
+        ),
+        meta=meta,
+    ).model_dump(mode="json")
+
+
+@mcp.tool(annotations=_JOB_LIFECYCLE, output_schema=RESULT_SCHEMA)
+async def codex_job_result(
+    job_id: str, ctx: Context | None = None, workspace_root: str | None = None
+) -> dict:
+    """Fetch a finished background delegate's result WITHOUT deleting the record.
+
+    Use when codex_job_status reports result_available=true. Returns the same
+    envelope as codex_delegate (with a `diff`), with meta.job_id set. A still-
+    running/cancelled/timed-out/failed job returns an error envelope. To fetch and
+    delete the record, use codex_job_consume_result."""
+    return await _job_result_impl(job_id, ctx, workspace_root, consume=False)
+
+
+@mcp.tool(annotations=_JOB_LIFECYCLE, output_schema=RESULT_SCHEMA)
+async def codex_job_consume_result(
+    job_id: str, ctx: Context | None = None, workspace_root: str | None = None
+) -> dict:
+    """Fetch a finished background delegate's result and delete the stored record.
+
+    Same envelope as codex_job_result, then removes completed job state. Use only
+    when you no longer need to poll or re-read the job. Non-done jobs are not
+    deleted."""
+    return await _job_result_impl(job_id, ctx, workspace_root, consume=True)
+
+
+@mcp.tool(annotations=_JOB_LIFECYCLE, output_schema=JOB_STATUS_SCHEMA)
+async def codex_job_cancel(
+    job_id: str, ctx: Context | None = None, workspace_root: str | None = None
+) -> dict:
+    """Cancel a running background delegate job.
+
+    Terminates the Codex process group and marks the job cancelled (cancelled jobs
+    cannot be resumed; the worktree is cleaned up). Already-terminal jobs are
+    returned unchanged. Free — no model call."""
+    cwd, source, err = await _resolve_job_workspace(ctx, workspace_root)
+    if err is not None:
+        return err
+    store = config.job_store()
+    data = await asyncio.to_thread(store.cancel, cwd, job_id)
+    if data is None:
+        return _job_not_found(job_id, _job_meta(cwd, source))
+    return _job_status_model(data).model_dump(mode="json")
+
+
+@mcp.tool(annotations=_JOB_LIFECYCLE, output_schema=JOB_LIST_SCHEMA)
+async def codex_job_list(ctx: Context | None = None, workspace_root: str | None = None) -> dict:
+    """List the background jobs known for this workspace, newest first.
+
+    Use to recover job_ids lost across context compaction or interruption. Returns
+    each job's id, kind, status, start time, result_available, and expiry. Free —
+    no model call."""
+    cwd, _source, err = await _resolve_job_workspace(ctx, workspace_root)
+    if err is not None:
+        return err
+    store = config.job_store()
+    rows = await asyncio.to_thread(store.list_jobs, cwd)
+    jobs = [
+        JobSummary(
+            job_id=r["job_id"],
+            kind=r["kind"],
+            status=r["status"],
+            started_at=r["started_at"],
+            elapsed_ms=r["elapsed_ms"],
+            result_available=r["result_available"],
+            expires_at=r["expires_at"],
+        )
+        for r in rows
+    ]
+    return JobListResult(jobs=jobs).model_dump(mode="json")
 
 
 def _finalize(result: codex.CodexExecResult, *, tool: str, meta: Meta) -> dict:
