@@ -46,14 +46,17 @@ agent-visible surface changes (tool names, params, error codes, value enums). Ke
 ## Release coordination
 
 Bump together: `pyproject.toml` version, `.claude-plugin/plugin.json`, the `@vX.Y.Z` tag in
-`.mcp.json`, `README.md`, `CHANGELOG.md`, and `FINGERPRINT` when the surface changed.
+`.mcp.json`, `CHANGELOG.md`, and `FINGERPRINT` when the surface changed. (`README.md` carries no
+pinned version literal — it uses a dynamic PyPI badge and marketplace install — so it needs no bump.)
+See `docs/RELEASING.md` for the full release procedure and the one-time PyPI/GitHub setup.
 
 ## Python support
 
 `requires-python>=3.11`, following SPEC 0 (support Python releases from roughly the last three
 years). CI runs the gate on every supported minor. The supported set is defined by the Python trove
 classifiers in `pyproject.toml`; a packaging test asserts the CI matrix in
-`.github/workflows/ci.yml` and the `requires-python` floor stay in lockstep with those classifiers
+`.github/workflows/test.yml` (the reusable gate called by both `ci.yml` and `publish.yml`) and the
+`requires-python` floor stay in lockstep with those classifiers
 (so this prose deliberately avoids naming specific versions). Changing the support set is
 deliberate: update the classifiers, the CI matrix, and `requires-python` together, and note it in
 `CHANGELOG.md`.
