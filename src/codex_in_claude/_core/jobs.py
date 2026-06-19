@@ -16,6 +16,17 @@ State lives on disk keyed by workspace, so status/result/cancel survive MCP serv
 restarts. There is no daemon: single-job calls refresh and TTL-clean the requested
 record, list calls clean the whole workspace, and the count cap is enforced when
 jobs start.
+
+Restart recovery: after a restart a prior worker is no longer this process's child,
+so a persisted PID alone cannot be trusted — a PID reused by an unrelated process
+must never be mistaken for the worker or signaled. Each worker therefore holds an
+exclusive advisory lock on ``<job_dir>/worker.lock`` for its whole life; the store
+treats that lock as the authority for liveness (a reused PID cannot hold this job's
+lock). A PID is trusted without the lock only for jobs this instance itself started
+(its own children); an unowned record whose lock is absent/indeterminate is treated
+as not-running rather than signaled, so cancel/timeout never touch an unrelated
+process. The lock needs a local filesystem to be reliable and uses POSIX ``fcntl``;
+platforms without it degrade to the owned-child check (and never signal unowned PIDs).
 """
 
 from __future__ import annotations
@@ -37,6 +48,13 @@ from uuid import uuid4
 
 _TERMINAL = frozenset({"done", "failed", "cancelled", "timeout"})
 _LOCK = threading.RLock()
+
+# Per-process identity stamped onto every job this process starts and compared on
+# read to decide ownership. Generated ONCE at import, so it is stable across the many
+# short-lived JobStore instances the server builds (one per tool call) and changes
+# only across a real restart (a new process re-imports this module). Persisted into
+# meta.json; a record whose owner differs was started by some other/earlier process.
+_PROCESS_OWNER = uuid4().hex
 
 # Default poll/backoff interval (ms) a job advertises to clients. The single source
 # for this value; the parent package re-exports it as the agent-visible constant.
@@ -100,23 +118,72 @@ def _is_running(pid: int | None) -> bool:
     return _pid_alive(pid)
 
 
+def _worker_lock_held(lock_path: Path) -> bool | None:
+    """Whether a live worker still holds the per-job lock at ``lock_path``.
+
+    ``True`` = held, so the worker is alive AND positively identified — a PID reused
+    by an unrelated process after a server restart cannot be holding *this* job's
+    lock. ``False`` = free (no live holder). ``None`` = indeterminate: the lock file
+    does not exist yet (worker still starting, or a job from before this hardening)
+    or ``fcntl`` is unavailable. Advisory locks need a local filesystem to be
+    reliable; on a network filesystem the result may be ``None``/unreliable, which
+    callers treat conservatively (no signaling of unverified PIDs)."""
+    try:
+        import fcntl  # noqa: PLC0415 - platform-guarded lazy import (POSIX only)
+    except ImportError:  # pragma: no cover - non-POSIX
+        return None
+    try:
+        fd = os.open(str(lock_path), os.O_RDONLY)
+    except OSError:
+        return None  # missing (worker not yet locked) or unreadable
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True  # someone holds it -> the worker is alive
+        except OSError:
+            return None
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)  # we grabbed it -> no holder; let it go
+        return False
+    finally:
+        os.close(fd)
+
+
+def _signal_proc(pid: int, sig: int) -> None:
+    """Send ``sig`` to the job's process group, but only when ``pid`` is its own group
+    leader — our workers are session leaders (``start_new_session=True``, so
+    ``pgid == pid``). If the PID was reused by a non-leader process we fall back to
+    signaling just that single PID rather than its unrelated group, narrowing the
+    residual window where a reused PID could be signaled."""
+    try:
+        leader = hasattr(os, "killpg") and os.getpgid(pid) == pid
+    except (ProcessLookupError, OSError):
+        return  # already gone / not signalable
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        if leader:
+            os.killpg(pid, sig)
+        else:  # pragma: no cover - reused non-leader PID / non-POSIX
+            os.kill(pid, sig)
+
+
 def _kill_pid_tree(pid: int | None) -> None:
-    """Kill the detached job's process group, then reap it if it was our child so
-    it does not linger as a zombie."""
+    """SIGKILL the detached job via :func:`_signal_proc` (its process group when
+    ``pid`` is the group leader — our workers are — else just that PID), then reap
+    it if it was our child so it does not linger as a zombie."""
     if not pid:
         return
-    try:
-        if hasattr(os, "killpg"):
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        else:  # pragma: no cover - non-POSIX fallback
-            os.kill(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+    _signal_proc(pid, signal.SIGKILL)
     with contextlib.suppress(ChildProcessError, OSError):
         os.waitpid(pid, 0)
 
 
-def _terminate_pid_tree(pid: int | None, grace_seconds: float) -> None:
+def _terminate_pid_tree(
+    pid: int | None,
+    grace_seconds: float,
+    *,
+    is_alive: Callable[[], bool] | None = None,
+) -> None:
     """Stop the detached job's process group gracefully, then force-kill if it
     overstays.
 
@@ -124,23 +191,26 @@ def _terminate_pid_tree(pid: int | None, grace_seconds: float) -> None:
     cleanup — for the propose tier that means a leaked temp worktree. So we send
     SIGTERM first and poll for up to ``grace_seconds`` (the worker cancels its run,
     tears down its worktree, and exits), then SIGKILL any survivor. Either way the
-    process is reaped so it cannot linger as a zombie."""
+    process is reaped so it cannot linger as a zombie.
+
+    ``is_alive`` is the liveness predicate used throughout — including before the
+    initial SIGTERM and before the SIGKILL escalation. Callers pass a lock-aware
+    check (``_job_running``) so that if the verified worker exits during the grace
+    window and its PID is then reused, we do not signal the unrelated process. It
+    defaults to the bare existence probe for direct/legacy callers."""
     if not pid:
         return
-    try:
-        if hasattr(os, "killpg"):
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        else:  # pragma: no cover - non-POSIX fallback
-            os.kill(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        _kill_pid_tree(pid)  # already gone or not signalable — reap if we can
+    alive = is_alive if is_alive is not None else (lambda: _is_running(pid))
+    if not alive():  # already gone (or no longer the verified worker)
         return
+    _signal_proc(pid, signal.SIGTERM)
     deadline = time.monotonic() + max(0.0, grace_seconds)
     while time.monotonic() < deadline:
-        if not _is_running(pid):  # exited gracefully (and was reaped)
+        if not alive():  # exited gracefully (and was reaped)
             return
         time.sleep(0.02)
-    _kill_pid_tree(pid)
+    if alive():  # still the verified worker after grace — force-kill it
+        _kill_pid_tree(pid)
 
 
 @dataclass
@@ -317,6 +387,7 @@ class JobStore:
                 "job_id": job_id,
                 "kind": kind,
                 "pid": proc.pid,
+                "owner": _PROCESS_OWNER,
                 "started_epoch": started,
                 "started_at": datetime.now(UTC).isoformat(),
                 "deadline_epoch": started + self.max_seconds,
@@ -329,14 +400,51 @@ class JobStore:
             return job_id, meta["started_at"]
 
     # ------------------------------------------------------------ status calc
+    @staticmethod
+    def _owned(meta: dict) -> bool:
+        """Whether THIS process started the job (its worker is our own child)."""
+        owner = meta.get("owner")
+        return bool(owner) and owner == _PROCESS_OWNER
+
+    def _job_running(self, jd: Path, meta: dict) -> bool:
+        """Whether the job's worker is alive AND safe to signal.
+
+        A held per-job lock is authoritative for ANY job: a PID reused by an unrelated
+        process after a restart cannot hold it, so such a PID is never mistaken for the
+        worker. For a job THIS process started (owned), the PID is our own child, so the
+        existence probe (``_is_running``, which reaps) is authoritative — and stays
+        correct during the worker's tiny create-then-``flock`` startup window, when the
+        lock briefly reads as free. An unowned job is treated as running only while its
+        worker still holds the lock; otherwise it is not running, so cancel/timeout
+        never signal a stale or reused PID."""
+        pid = meta.get("pid")
+        if not pid:
+            return False
+        if _worker_lock_held(jd / "worker.lock") is True:
+            return True  # positively verified alive (a reused PID can't hold this lock)
+        if self._owned(meta):
+            return _is_running(pid)  # our own child: the PID probe is authoritative
+        return False  # unowned + no verified lock -> never reported running or signaled
+
     def _status_of(self, jd: Path, meta: dict) -> str:
         """Compute the live status, killing + marking jobs that overran."""
         terminal = meta.get("terminal_status")
         if terminal:
             return terminal
-        if _is_running(meta.get("pid")):
+        if self._job_running(jd, meta):
             if time.time() > meta.get("deadline_epoch", float("inf")):
-                _terminate_pid_tree(meta.get("pid"), self.terminate_grace_seconds)
+                _terminate_pid_tree(
+                    meta.get("pid"),
+                    self.terminate_grace_seconds,
+                    is_alive=lambda: self._job_running(jd, meta),
+                )
+                # The worker may have completed during the grace window — prefer its
+                # result over masking it as a timeout (result-first finalization).
+                if self._read_envelope(jd) is not None:
+                    if meta.get("completed_epoch") is None:
+                        meta["completed_epoch"] = time.time()
+                        self._write_meta(jd, meta)
+                    return "done"
                 self._finalize_cleanup(jd, meta, "timeout", self._read_cleanup_manifest(jd))
                 return "timeout"
             return "running"
@@ -483,8 +591,14 @@ class JobStore:
                 return self._status_dict(jd, meta, state)
             pid = meta.get("pid")
         # Terminate with the lock released: the graceful-shutdown grace wait must
-        # not block status/list/result calls for every workspace.
-        _terminate_pid_tree(pid, self.terminate_grace_seconds)
+        # not block status/list/result calls for every workspace. Liveness stays
+        # lock-aware throughout, so a worker that exits mid-grace (and a PID then
+        # reused) is never signaled.
+        _terminate_pid_tree(
+            pid,
+            self.terminate_grace_seconds,
+            is_alive=lambda m=meta: self._job_running(jd, m),
+        )
         with _LOCK:
             # Re-validate: during the unlocked grace window the record may have been
             # consumed/evicted, finalized by another path, or the worker may have
