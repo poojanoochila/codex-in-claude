@@ -259,6 +259,9 @@ async def test_review_extra_context_too_large(monkeypatch, clean_env, tmp_path):
     assert res["ok"] is False
     assert res["error"]["code"] == "input_too_large"
     assert res["error"]["offending_param"] == "extra_context"
+    # The review path (run_review) also carries the structured size fields (#95).
+    assert res["error"]["limit_bytes"] == 1000
+    assert res["error"]["actual_bytes"] == 2000
 
 
 async def test_dry_run_extra_context_grows_prompt_bytes(monkeypatch, clean_env, tmp_path):
@@ -281,6 +284,8 @@ async def test_dry_run_extra_context_too_large(monkeypatch, clean_env, tmp_path)
     assert res["ok"] is False
     assert res["error"]["code"] == "input_too_large"
     assert res["error"]["offending_param"] == "extra_context"
+    assert res["error"]["limit_bytes"] == 1000
+    assert res["error"]["actual_bytes"] == 2000
 
 
 async def test_dry_run_advertises_returnable_error_codes():
@@ -976,6 +981,8 @@ async def test_delegate_dry_run_input_too_large(monkeypatch, clean_env, tmp_path
     res = await server.codex_delegate_dry_run("z" * 2000, workspace_root=str(tmp_path))
     assert res["ok"] is False
     assert res["error"]["code"] == "input_too_large"
+    assert res["error"]["limit_bytes"] == 1000
+    assert res["error"]["actual_bytes"] == 2000
 
 
 async def test_delegate_dry_run_placeholder_env(monkeypatch, clean_env, tmp_path):
@@ -1152,6 +1159,8 @@ async def test_delegate_async_input_too_large(monkeypatch, clean_env, tmp_path):
     res = await server.codex_delegate_async("z" * 2000, workspace_root=str(tmp_path))
     assert res["ok"] is False
     assert res["error"]["code"] == "input_too_large"
+    assert res["error"]["limit_bytes"] == 1000
+    assert res["error"]["actual_bytes"] == 2000
 
 
 async def test_job_status_done(monkeypatch, clean_env, tmp_path):
@@ -1349,8 +1358,8 @@ def test_capabilities_lists_m4_tools():
         assert t in caps["free_tools"]
 
 
-def test_fingerprint_is_schema_9():
-    assert FINGERPRINT == "codex-in-claude/0.1/schema-9"
+def test_fingerprint_is_schema_10():
+    assert FINGERPRINT == "codex-in-claude/0.1/schema-10"
 
 
 def test_capabilities_mark_m4_surface_experimental():
@@ -1580,6 +1589,9 @@ async def test_consult_async_input_too_large(monkeypatch, clean_env, tmp_path):
     assert res["ok"] is False
     assert res["error"]["code"] == "input_too_large"
     assert res["error"]["offending_param"] == "extra_context"
+    assert res["error"]["limit_bytes"] == 1000
+    # actual_bytes covers question + extra_context: len("q") + 2000.
+    assert res["error"]["actual_bytes"] == 2001
 
 
 async def test_consult_async_placeholder_env(monkeypatch, clean_env, tmp_path):
@@ -2046,6 +2058,88 @@ async def test_boundary_propagates_cancellation(monkeypatch, clean_env, tmp_path
     monkeypatch.setattr(server.codex, "run_codex_exec", cancel)
     with pytest.raises(asyncio.CancelledError):
         await server.codex_consult("q", workspace_root=str(tmp_path))
+
+
+# --- structured repair fields for size/workspace errors (#95) ----------------
+async def test_input_too_large_carries_size_fields_consult(monkeypatch, clean_env, tmp_path):
+    """input_too_large exposes the byte limit and the offending input's actual size in
+    machine-readable fields, while keeping the prose repair (#95)."""
+    monkeypatch.setattr(server.config, "max_input_bytes", lambda: 10)
+    res = await server.codex_consult("x" * 50, workspace_root=str(tmp_path))
+    assert res["ok"] is False
+    err = res["error"]
+    assert err["code"] == "input_too_large"
+    assert err["limit_bytes"] == 10
+    assert err["actual_bytes"] == 50
+    assert "10" in err["message"] and err["repair"]  # prose retained
+
+
+async def test_input_too_large_carries_size_fields_delegate(monkeypatch, clean_env, tmp_path):
+    """The task-input path (delegate) also carries limit_bytes/actual_bytes (#95)."""
+    monkeypatch.setattr(server.config, "max_input_bytes", lambda: 10)
+    res = await server.codex_delegate("x" * 50, workspace_root=str(tmp_path))
+    assert res["ok"] is False
+    assert res["error"]["code"] == "input_too_large"
+    assert res["error"]["offending_param"] == "task"
+    assert res["error"]["limit_bytes"] == 10
+    assert res["error"]["actual_bytes"] == 50
+
+
+async def test_workspace_outside_roots_carries_candidate_roots(monkeypatch, clean_env, tmp_path):
+    """workspace_outside_roots attaches the client-supplied MCP roots as candidate_roots
+    so an agent can pick a valid workspace_root without parsing prose (#95)."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "other"
+    outside.mkdir()
+
+    async def fake_roots(ctx):
+        return [str(root)]
+
+    monkeypatch.setattr(server, "_roots_from_ctx", fake_roots)
+    res = await server.codex_consult("q", workspace_root=str(outside))
+    assert res["ok"] is False
+    assert res["error"]["code"] == "workspace_outside_roots"
+    assert res["error"]["candidate_roots"] == [str(root)]
+
+
+async def test_invalid_workspace_root_omits_candidate_roots(monkeypatch, clean_env, tmp_path):
+    """candidate_roots is scoped to the outside-roots error only — an invalid (relative)
+    workspace_root leaves it null even when client roots are present (#95)."""
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    async def fake_roots(ctx):
+        return [str(root)]
+
+    monkeypatch.setattr(server, "_roots_from_ctx", fake_roots)
+    res = await server.codex_consult("q", workspace_root="relative/not/abs")
+    assert res["error"]["code"] == "invalid_workspace_root"
+    assert res["error"]["candidate_roots"] is None
+
+
+async def test_roots_from_ctx_filters_non_absolute_and_non_file(tmp_path):
+    """_roots_from_ctx returns only non-empty absolute file:// paths, so candidate_roots
+    never advertises a malformed (empty/relative) or non-file root (#95, Copilot review)."""
+
+    class _Root:
+        def __init__(self, uri):
+            self.uri = uri
+
+    class _Ctx:
+        async def list_roots(self):
+            return [
+                _Root(f"file://{tmp_path}"),  # valid absolute (empty authority) -> kept
+                _Root(f"file://localhost{tmp_path}"),  # localhost authority -> kept
+                _Root("file:relative/path"),  # relative -> dropped
+                _Root("file://"),  # empty path -> dropped
+                _Root("file://example.com/tmp/repo"),  # remote host -> dropped
+                _Root("file://C:/repo"),  # drive-letter authority -> dropped
+                _Root("https://example.com"),  # non-file scheme -> dropped
+            ]
+
+    paths = await server._roots_from_ctx(_Ctx())
+    assert paths == [str(tmp_path), str(tmp_path)]
 
 
 # --- async job-lifecycle capability metadata (#94) ---------------------------
