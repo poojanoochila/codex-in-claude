@@ -1,0 +1,448 @@
+import json
+
+import pytest
+from pydantic import ValidationError
+
+from codex_in_claude import schemas as s
+from codex_in_claude.schemas import ErrorDetail, ErrorInfo, Repair
+
+
+def test_repair_next_step_is_symbolic_and_optional_fields_default_none():
+    r = Repair(next_step="poll_job_status")
+    assert r.next_step == "poll_job_status"
+    assert r.tool is None and r.arguments is None and r.alternative is None
+
+
+def test_errorinfo_requires_temporary_and_retry_after_ms_in_schema():
+    schema = ErrorInfo.model_json_schema()
+    assert "temporary" in schema["required"]
+    assert "retry_after_ms" in schema["required"]
+
+
+def test_errorinfo_invariant_non_temporary_forbids_retry_after_ms():
+    with pytest.raises(ValidationError):
+        ErrorInfo(code="internal_error", message="x", temporary=False, retry_after_ms=5)
+
+
+def test_errorinfo_retry_after_ms_must_be_non_negative():
+    with pytest.raises(ValidationError):
+        ErrorInfo(code="codex_rate_limited", message="x", temporary=True, retry_after_ms=-1)
+
+
+def test_errorinfo_temporary_with_backoff_ok():
+    e = ErrorInfo(code="codex_rate_limited", message="x", temporary=True, retry_after_ms=60000)
+    assert e.temporary is True and e.retry_after_ms == 60000
+
+
+def test_errordetail_has_no_value_field():
+    assert "value" not in ErrorDetail.model_fields
+
+
+# ---------------------------------------------------------------------------
+# Task 3: published_schema / opaque-error branch tests
+# ---------------------------------------------------------------------------
+
+_ALL_SCHEMAS = {
+    "CONSULT_RESULT_SCHEMA": s.CONSULT_RESULT_SCHEMA,
+    "REVIEW_RESULT_SCHEMA": s.REVIEW_RESULT_SCHEMA,
+    "DELEGATE_RESULT_SCHEMA": s.DELEGATE_RESULT_SCHEMA,
+    "JOB_RESULT_SCHEMA": s.JOB_RESULT_SCHEMA,
+    "STATUS_SCHEMA": s.STATUS_SCHEMA,
+    "CAPABILITIES_SCHEMA": s.CAPABILITIES_SCHEMA,
+    "MODEL_CATALOG_SCHEMA": s.MODEL_CATALOG_SCHEMA,
+    "JOB_STARTED_SCHEMA": s.JOB_STARTED_SCHEMA,
+    "JOB_STATUS_SCHEMA": s.JOB_STATUS_SCHEMA,
+    "DRY_RUN_SCHEMA": s.DRY_RUN_SCHEMA,
+    "DELEGATE_DRY_RUN_SCHEMA": s.DELEGATE_DRY_RUN_SCHEMA,
+    "JOB_LIST_SCHEMA": s.JOB_LIST_SCHEMA,
+}
+
+
+def _all_refs(node):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "$ref" and isinstance(v, str):
+                yield v
+            else:
+                yield from _all_refs(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _all_refs(v)
+
+
+def _has_key(node, key):
+    if isinstance(node, dict):
+        if key in node:
+            return True
+        return any(_has_key(v, key) for v in node.values())
+    if isinstance(node, list):
+        return any(_has_key(v, key) for v in node)
+    return False
+
+
+@pytest.mark.parametrize("name,sch", _ALL_SCHEMAS.items())
+def test_all_refs_resolve(name, sch):
+    defs = set(sch.get("$defs", {}))
+    for ref in _all_refs(sch):
+        assert ref.startswith("#/$defs/"), f"{name}: non-local ref {ref}"
+        assert ref.split("/")[-1] in defs, f"{name}: dangling ref {ref}"
+
+
+@pytest.mark.parametrize("name,sch", _ALL_SCHEMAS.items())
+def test_no_errorinfo_def_embedded(name, sch):
+    assert "ErrorInfo" not in sch.get("$defs", {}), f"{name} still embeds ErrorInfo"
+
+
+def _annotation_title_present(node: object) -> bool:
+    """Return True if any schema OBJECT has a top-level ``title`` annotation key.
+
+    Distinguishes annotation ``title`` (a key directly in a schema dict alongside
+    ``type``/``properties``/etc.) from a property NAME that happens to be ``title``
+    (a key inside a ``properties`` or ``$defs`` mapping).  The latter is legitimate
+    and must not be flagged.
+    """
+    if isinstance(node, dict):
+        # Keys inside these maps are property/def names, not annotations.
+        _SUBSCHEMA_MAP_KEYS = frozenset(
+            ("properties", "$defs", "definitions", "patternProperties", "dependentSchemas")
+        )
+        if "title" in node:
+            return True
+        for k, v in node.items():
+            if k in _SUBSCHEMA_MAP_KEYS and isinstance(v, dict):
+                # Recurse into sub-schema values only, not into the map keys.
+                if any(_annotation_title_present(sub) for sub in v.values()):
+                    return True
+            elif _annotation_title_present(v):
+                return True
+    elif isinstance(node, list):
+        return any(_annotation_title_present(v) for v in node)
+    return False
+
+
+@pytest.mark.parametrize("name,sch", _ALL_SCHEMAS.items())
+def test_noise_stripped_except_error_pointer(name, sch):
+    # No schema-object-level ``title`` annotations (generated Pydantic noise).
+    assert not _annotation_title_present(sch), f"{name} has a title annotation"
+    # No ``default`` annotations anywhere (a field named ``default`` is fine but
+    # Pydantic models here do not use that name, so _has_key is safe for defaults).
+    assert not _has_key(sch, "default"), f"{name} has a default"
+    # exactly one description survives: the opaque-error pointer
+    text = json.dumps(sch)
+    assert text.count('"description"') == 1
+    assert "codex://error-envelope" in text
+    # Finding.title property is preserved in schemas that carry findings.
+    if "Finding" in sch.get("$defs", {}):
+        finding_def = sch["$defs"]["Finding"]
+        assert "title" not in finding_def, (
+            "Finding $def must not have an object-level title annotation"
+        )
+        assert "title" in finding_def.get("properties", {}), (
+            "Finding.title property must be present"
+        )
+
+
+@pytest.mark.parametrize("name,sch", _ALL_SCHEMAS.items())
+def test_opaque_error_branch_present(name, sch):
+    branches = sch["anyOf"]
+    err = [b for b in branches if b.get("properties", {}).get("ok", {}).get("const") is False]
+    assert len(err) == 1, f"{name}: expected exactly one error branch"
+    eb = err[0]
+    assert eb["properties"]["error"] == {
+        "type": "object",
+        "description": "Populated error envelope; full schema at resource codex://error-envelope",
+    }
+    assert eb["properties"]["meta"] == {"type": "object"}
+    assert set(eb["required"]) == {"ok", "error", "meta"}
+
+
+def test_job_result_schema_has_four_branches():
+    assert len(s.JOB_RESULT_SCHEMA["anyOf"]) == 4
+
+
+def test_status_result_has_no_default_errors():
+    assert "default_errors" not in s.StatusResult.model_fields
+
+
+def test_error_envelope_schema_validates_runtime_error():
+    from pydantic import TypeAdapter
+
+    from codex_in_claude.errors import make_error, serialize_error
+    from codex_in_claude.schemas import ErrorResult, Meta
+
+    env = ErrorResult(
+        error=make_error("job_running", "x", retry_after_ms=2000, repair_arguments={"job_id": "j"}),
+        meta=Meta(
+            cwd="/x",
+            tier="consult",
+            sandbox="read-only",
+            isolation="inherit",
+            timeout_seconds=180,
+            elapsed_ms=1,
+        ),
+    )
+    payload = serialize_error(env)
+    TypeAdapter(ErrorResult).validate_python(payload)  # round-trips against the model
+    assert s.ERROR_ENVELOPE_SCHEMA["$defs"]  # full schema is published with defs
+
+
+def test_no_raw_errorresult_model_dump_outside_serializer():
+    import ast
+    import pathlib
+
+    src = pathlib.Path("src/codex_in_claude")
+    offenders = []
+    for p in src.rglob("*.py"):
+        if p.name == "errors.py":
+            continue
+        tree = ast.parse(p.read_text(), filename=str(p))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "model_dump"
+                and isinstance(node.func.value, ast.Call)
+                and isinstance(node.func.value.func, ast.Name)
+                and node.func.value.func.id == "ErrorResult"
+            ):
+                offenders.append(f"{p}:{node.lineno}")
+    assert not offenders, f"raw ErrorResult.model_dump outside errors.py: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# ERROR_ENVELOPE_SCHEMA hardening tests (jsonschema)
+# ---------------------------------------------------------------------------
+
+
+def test_error_envelope_validates_temporary_error():
+    """A valid rate-limited (temporary=True, retry_after_ms set) envelope validates."""
+    import jsonschema
+
+    from codex_in_claude.errors import make_error, serialize_error
+    from codex_in_claude.schemas import ERROR_ENVELOPE_SCHEMA, ErrorResult, Meta
+
+    env = ErrorResult(
+        error=make_error("codex_rate_limited", "rate limited", retry_after_ms=5000),
+        meta=Meta(
+            cwd="/x",
+            tier="consult",
+            sandbox="read-only",
+            isolation="inherit",
+            timeout_seconds=180,
+            elapsed_ms=1,
+        ),
+    )
+    payload = serialize_error(env)
+    jsonschema.Draft202012Validator(ERROR_ENVELOPE_SCHEMA).validate(payload)  # must not raise
+
+
+def test_error_envelope_validates_non_temporary_error():
+    """A valid non-temporary error (invalid_arguments, retry_after_ms=null) validates."""
+    import jsonschema
+
+    from codex_in_claude.errors import make_error, serialize_error
+    from codex_in_claude.schemas import ERROR_ENVELOPE_SCHEMA, ErrorResult, Meta
+
+    env = ErrorResult(
+        error=make_error("invalid_arguments", "bad args"),
+        meta=Meta(
+            cwd="/x",
+            tier="consult",
+            sandbox="read-only",
+            isolation="inherit",
+            timeout_seconds=180,
+            elapsed_ms=1,
+        ),
+    )
+    payload = serialize_error(env)
+    jsonschema.Draft202012Validator(ERROR_ENVELOPE_SCHEMA).validate(payload)  # must not raise
+
+
+def test_error_envelope_rejects_missing_ok():
+    """An envelope missing the required 'ok' field is rejected by the schema."""
+    import jsonschema
+
+    from codex_in_claude.schemas import ERROR_ENVELOPE_SCHEMA
+
+    bad = {
+        "error": {
+            "code": "internal_error",
+            "message": "x",
+            "temporary": False,
+            "retry_after_ms": None,
+        },
+        "meta": {
+            "cwd": "/x",
+            "tier": "consult",
+            "sandbox": "read-only",
+            "isolation": "inherit",
+            "timeout_seconds": 180,
+            "elapsed_ms": 1,
+        },
+    }
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.Draft202012Validator(ERROR_ENVELOPE_SCHEMA).validate(bad)
+
+
+def test_error_envelope_rejects_invariant_violation():
+    """An envelope with temporary=False and retry_after_ms=5 violates the model invariant."""
+    import jsonschema
+
+    from codex_in_claude.schemas import ERROR_ENVELOPE_SCHEMA
+
+    bad = {
+        "ok": False,
+        "error": {
+            "code": "internal_error",
+            "message": "x",
+            "temporary": False,
+            "retry_after_ms": 5,
+        },
+        "meta": {
+            "cwd": "/x",
+            "tier": "consult",
+            "sandbox": "read-only",
+            "isolation": "inherit",
+            "timeout_seconds": 180,
+            "elapsed_ms": 1,
+        },
+    }
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        jsonschema.Draft202012Validator(ERROR_ENVELOPE_SCHEMA).validate(bad)
+
+
+def test_error_envelope_schema_has_dialect():
+    """ERROR_ENVELOPE_SCHEMA declares the 2020-12 dialect.
+
+    Pydantic v2 emits $defs → 2020-12-style references.
+    """
+    from codex_in_claude.schemas import ERROR_ENVELOPE_SCHEMA
+
+    assert ERROR_ENVELOPE_SCHEMA["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+
+
+# ---------------------------------------------------------------------------
+# Task 4: CI catalog-size gate
+# ---------------------------------------------------------------------------
+
+
+def _wire_catalog_bytes() -> int:
+    import asyncio
+
+    from codex_in_claude.server import mcp
+
+    tools = asyncio.run(mcp.list_tools())
+    catalog = [
+        t.to_mcp_tool().model_dump(mode="json", by_alias=True, exclude_none=True) for t in tools
+    ]
+    return len(json.dumps(catalog, separators=(",", ":")).encode("utf-8"))
+
+
+# Cap = real MCP wire catalog (~103,526 bytes, incl. annotations/_meta) + ~12% headroom.
+# Was ~180,266 pre-shrink.
+CATALOG_BYTE_CAP = 116_000
+
+
+def test_wire_catalog_under_cap():
+    size = _wire_catalog_bytes()
+    assert size <= CATALOG_BYTE_CAP, f"catalog grew to {size} bytes (cap {CATALOG_BYTE_CAP})"
+
+
+# ---------------------------------------------------------------------------
+# Success-schema validation with non-empty findings (Finding.title regression)
+# Verifies that _strip_schema_noise preserves the Finding.title property so
+# jsonschema.validate does not reject a real payload as an additional property.
+# ---------------------------------------------------------------------------
+
+
+def _make_meta() -> s.Meta:
+    return s.Meta(
+        cwd="/repo",
+        tier="consult",
+        sandbox="read-only",
+        isolation="inherit",
+        timeout_seconds=180,
+        elapsed_ms=42,
+    )
+
+
+def _make_finding() -> s.Finding:
+    return s.Finding(
+        severity="high",
+        title="Example finding title",
+        file="src/foo.py",
+        line=10,
+        evidence="some evidence",
+        risk="breaks strict MCP clients",
+        recommendation="fix the stripper",
+    )
+
+
+def test_consult_result_with_findings_validates_against_schema():
+    """CONSULT_RESULT_SCHEMA must accept a ConsultResult that has a non-empty findings list."""
+    import jsonschema
+
+    result = s.ConsultResult(
+        summary="All good",
+        findings=[_make_finding()],
+        meta=_make_meta(),
+    )
+    payload = result.model_dump(mode="json")
+    jsonschema.validate(payload, s.CONSULT_RESULT_SCHEMA)
+
+
+def test_review_result_with_findings_validates_against_schema():
+    """REVIEW_RESULT_SCHEMA must accept a ReviewResult with verdict/confidence and findings."""
+    import jsonschema
+
+    result = s.ReviewResult(
+        summary="Review done",
+        verdict="concerns",
+        confidence="high",
+        findings=[_make_finding()],
+        meta=_make_meta(),
+    )
+    payload = result.model_dump(mode="json")
+    jsonschema.validate(payload, s.REVIEW_RESULT_SCHEMA)
+
+
+def test_delegate_result_with_findings_validates_against_schema():
+    """DELEGATE_RESULT_SCHEMA must accept a DelegateResult with a diff and findings."""
+    import jsonschema
+
+    result = s.DelegateResult(
+        summary="Delegate done",
+        diff="--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n",
+        findings=[_make_finding()],
+        meta=_make_meta(),
+    )
+    payload = result.model_dump(mode="json")
+    jsonschema.validate(payload, s.DELEGATE_RESULT_SCHEMA)
+
+
+def test_job_result_consult_variant_with_findings_validates_against_schema():
+    """JOB_RESULT_SCHEMA must accept a ConsultResult variant with findings."""
+    import jsonschema
+
+    result = s.ConsultResult(
+        summary="Job consult done",
+        findings=[_make_finding()],
+        meta=_make_meta(),
+    )
+    payload = result.model_dump(mode="json")
+    jsonschema.validate(payload, s.JOB_RESULT_SCHEMA)
+
+
+def test_job_result_review_variant_with_findings_validates_against_schema():
+    """JOB_RESULT_SCHEMA must accept a ReviewResult variant with findings."""
+    import jsonschema
+
+    result = s.ReviewResult(
+        summary="Job review done",
+        verdict="fail",
+        confidence="low",
+        findings=[_make_finding()],
+        meta=_make_meta(),
+    )
+    payload = result.model_dump(mode="json")
+    jsonschema.validate(payload, s.JOB_RESULT_SCHEMA)

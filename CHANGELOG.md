@@ -41,13 +41,33 @@ agent-visible MCP surface; the result `fingerprint` changes when they do.
   a repeat consume returns not-found, a different response, since the first call deletes the record.
   (#141)
 
+### Added
+
+- `codex://error-envelope` resource publishing the full error schema; a pointer to it in
+  `codex_capabilities`.
+- CI gate capping the serialized `tools/list` catalog size.
+
 ### Changed
 
-- The result `fingerprint` changes (`codex-in-claude/0.1/schema-12` → `codex-in-claude/0.1/schema-15`)
+- **BREAKING:** Error envelope reshaped to the agent-friendly-mcp §6 contract: `retryable` →
+  `temporary`; flat `repair`/`repair_tool`/`repair_tool_params`/`offending_param`/`allowed_values`
+  fold into `repair{next_step,tool,arguments,alternative}` (symbolic `next_step`) and
+  `details{field,reason,allowed_values}`. Absent optionals are stripped (placeholder nulls gone);
+  `retry_after_ms` is always present. (#135)
+- **BREAKING:** Per-tool `outputSchema`s now publish the success shape plus one compact opaque
+  error branch; the full error schema moves to the `codex://error-envelope` resource. Cuts the
+  preloaded `tools/list` catalog ~44% (≈180 KB → ≈101 KB). (#137)
+- **BREAKING:** Removed unused `StatusResult.default_errors`.
+- Background-job *error* results written by a pre-upgrade server that no longer match the
+  schema-16 error envelope are returned as a corrupt `internal_error` result; compatible *success*
+  results are still returned (with `fingerprint` re-stamped).
+  (Migration: invalidate stale error results.)
+- The result `fingerprint` changes (`codex-in-claude/0.1/schema-12` → `codex-in-claude/0.1/schema-16`)
   for the agent-visible changes above (the async `readOnlyHint` fix #138 advanced it to `schema-13`;
   the `codex_job_cancel` `idempotentHint` fix #141 advanced it to `schema-14`; the `invalid_arguments`
-  envelope #136 advanced it to `schema-15`). Pre-1.0, these changes make the next release a minor;
-  clients that cache by `fingerprint` re-fetch the contract.
+  envelope #136 advanced it to `schema-15`; the error-envelope reshape #135 and catalog shrink #137
+  advanced it to `schema-16`). Pre-1.0, these changes make the next release a minor; clients that
+  cache by `fingerprint` re-fetch the contract.
 
 ## [0.5.0] - 2026-06-26
 

@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from codex_in_claude._core.jobs import DEFAULT_POLL_AFTER_MS
 
 # Bump this whenever the agent-visible surface changes: tool names, input or
 # output schemas, the ErrorCode set, the tier/sandbox/isolation/scope value sets,
 # or the capability guarantees. Clients cache by it.
-FINGERPRINT = "codex-in-claude/0.1/schema-15"
+FINGERPRINT = "codex-in-claude/0.1/schema-16"
 
 # Default poll/backoff interval (ms) shared by job handles and the job_running
 # error's retry_after_ms, so the "when to retry" hint stays consistent in one place.
@@ -363,33 +364,69 @@ class InvalidArgument(BaseModel):
     # allowed_values drive the repair without copying input into the result (#136).
 
 
+RepairStep = Literal[
+    "retry_after_delay",
+    "correct_arguments",
+    "use_allowed_value",
+    "reduce_input",
+    "use_workspace_in_roots",
+    "poll_job_status",
+    "list_jobs",
+    "start_new_job",
+    "authenticate",
+    "install_codex",
+    "install_git",
+    "init_git_repo",
+    "update_plugin",
+    "inspect_and_retry",
+    "retry_then_report",
+]
+
+
+class Repair(BaseModel):
+    """Machine-actionable recovery guidance (agent-friendly-mcp §6). `next_step` is a
+    STABLE SYMBOLIC label an agent branches on (not prose); `alternative` carries the
+    human-readable fallback. `tool`/`arguments` name a tool to call to recover."""
+
+    model_config = ConfigDict(extra="forbid")
+    next_step: RepairStep
+    tool: str | None = None
+    arguments: dict[str, Any] | None = None
+    alternative: str | None = None
+
+
+class ErrorDetail(BaseModel):
+    """§6 details{field, value, reason}. `value` is deliberately omitted: a Literal/string
+    param accepts arbitrary input that could be a secret, and best-effort redaction cannot
+    reliably catch a plain one; the caller already holds what it sent. Documented divergence."""
+
+    model_config = ConfigDict(extra="forbid")
+    field: str | None = None
+    reason: str | None = None
+    allowed_values: list[str] | None = None
+
+
 class ErrorInfo(BaseModel):
     model_config = ConfigDict(extra="forbid")
     code: ErrorCode
     message: str
-    repair: str  # prose guidance; the structured fields below are the machine-actionable form
-    offending_param: str | None = None
-    retryable: bool = False
-    # Per-field argument-validation failures, set only for the invalid_arguments code
-    # (#136). The top-level offending_param/allowed_values mirror the first entry so
-    # callers that already branch on those fields keep working.
+    # §6: both always present in the canonical schema. `temporary` was `retryable`.
+    temporary: bool = Field(...)
+    retry_after_ms: int | None = Field(..., ge=0)
+    repair: Repair | None = None  # omitted only when no corrective path exists
+    details: ErrorDetail | None = None
+    # Multi-field validation carrier (#136); details mirrors the first entry.
     invalid_arguments: list[InvalidArgument] | None = None
-    # Machine-actionable repair metadata — set when known so an agent can recover
-    # without parsing `repair` prose. All optional/backward-compatible.
-    allowed_values: list[str] | None = None  # concrete valid values for an enum-like param
-    repair_tool: str | None = None  # a tool to call to recover (e.g. codex_job_status)
-    # args for repair_tool, e.g. {"job_id": ...}; values are arbitrary JSON since tool
-    # arguments aren't all strings.
-    repair_tool_params: dict[str, Any] | None = None
-    retry_after_ms: int | None = None  # suggested backoff before retrying a retryable error
-    # Size context for input_too_large, so an agent can trim by an exact amount without
-    # parsing the message prose (#95).
-    limit_bytes: int | None = None  # the byte limit that was exceeded
-    actual_bytes: int | None = None  # the offending input's actual byte size
-    # For workspace_outside_roots: the client-supplied MCP roots a valid workspace_root
-    # must sit inside. Populated ONLY from roots the client already provided — never
-    # arbitrary local filesystem paths — so it leaks no extra path context (#95).
+    # Documented top-level extensions (unchanged):
+    limit_bytes: int | None = None
+    actual_bytes: int | None = None
     candidate_roots: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _retry_after_only_when_temporary(self) -> ErrorInfo:
+        if not self.temporary and self.retry_after_ms is not None:
+            raise ValueError("retry_after_ms must be None when temporary is False")
+        return self
 
 
 class ErrorResult(BaseModel):
@@ -433,7 +470,6 @@ class StatusResult(BaseModel):
     readiness_detail: str
     raw_defaults: RawDefaults
     resolved_defaults: ResolvedDefaults
-    default_errors: list[ErrorInfo] = Field(default_factory=list)
     rate_limit: RateLimit = Field(  # always present; status 'unknown' when no cache
         default_factory=lambda: RateLimit(status="unknown")
     )
@@ -505,6 +541,7 @@ class CapabilitiesResult(BaseModel):
     negative_scope: list[str]  # what it deliberately does NOT do
     prerequisites: list[str]
     deprecation_policy: str
+    error_envelope_resource: str = "codex://error-envelope"
 
 
 ModelCatalogSource = Literal["cache", "static", "none"]
@@ -669,50 +706,145 @@ class JobListResult(BaseModel):
     fingerprint: str = FINGERPRINT
 
 
-def _object_union_schema(adapter: TypeAdapter) -> dict:
-    """Wrap a model union's anyOf in a top-level object schema.
+_OPAQUE_ERROR_BRANCH = {
+    "type": "object",
+    "required": ["ok", "error", "meta"],
+    "properties": {
+        "ok": {"const": False},
+        "error": {
+            "type": "object",
+            "description": "Populated error envelope; full schema at resource codex://error-envelope",
+        },
+        "meta": {"type": "object"},
+    },
+}
+_ERROR_POINTER_DESC = _OPAQUE_ERROR_BRANCH["properties"]["error"]["description"]
 
-    MCP/FastMCP require an output schema whose top level is ``type: object``;
-    a bare ``anyOf`` is rejected. We keep the discriminating ``ok`` key visible
-    at the top and carry the full branch schemas (and their $defs) underneath.
+
+# Keys whose VALUES are sub-schema maps (property name → sub-schema).
+# The keys of these maps are NAMES (e.g. a field called "title"), NOT JSON-Schema
+# annotation keywords, so they must never be stripped.
+_SUBSCHEMA_MAPS = frozenset(
+    ("properties", "$defs", "definitions", "patternProperties", "dependentSchemas")
+)
+
+
+def _strip_schema_noise(node: object) -> object:
+    """Recursively drop generated `title`/`description`/`default`, keeping only the one
+    intentional error-pointer description.
+
+    Context-aware: keys that appear inside a *subschema map* (``properties``,
+    ``$defs``, etc.) are property/definition NAMES, not JSON-Schema annotation
+    keywords.  A Pydantic model field named ``title`` or ``default`` must not be
+    removed from the map — only the object-level annotations should be stripped.
     """
-    union = adapter.json_schema()
-    return {
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if k in ("title", "default"):
+                continue
+            if k == "description" and v != _ERROR_POINTER_DESC:
+                continue
+            if k in _SUBSCHEMA_MAPS and isinstance(v, dict):
+                # Preserve the map keys (they are names, not annotations);
+                # recurse only into each sub-schema value.
+                out[k] = {name: _strip_schema_noise(sub) for name, sub in v.items()}
+            else:
+                out[k] = _strip_schema_noise(v)
+        return out
+    if isinstance(node, list):
+        return [_strip_schema_noise(v) for v in node]
+    return node
+
+
+def published_schema(*success_models: type[BaseModel]) -> dict:  # type: ignore[type-arg]
+    """Build a tool's advertised outputSchema: the success branch(es) plus ONE fully
+    opaque error branch. The opaque branch references no $def, so $defs is exactly the
+    success closure (no ErrorInfo, no dangling refs). Generated noise is stripped."""
+    if len(success_models) == 1:
+        adapter: TypeAdapter = TypeAdapter(success_models[0])  # type: ignore[type-arg]
+    else:
+        union = success_models[0]
+        for m in success_models[1:]:
+            union = union | m  # type: ignore[operator]
+        adapter = TypeAdapter(union)  # type: ignore[type-arg]
+    raw = adapter.json_schema(ref_template="#/$defs/{model}")
+    if "anyOf" in raw:
+        branches = list(raw["anyOf"])
+    else:
+        branches = [{k: v for k, v in raw.items() if k != "$defs"}]
+    doc = {
         "type": "object",
         "properties": {
             "ok": {"type": "boolean", "description": "true = success result, false = error result"},
         },
         "required": ["ok"],
-        "anyOf": union["anyOf"],
-        "$defs": union.get("$defs", {}),
+        "anyOf": [*branches, _OPAQUE_ERROR_BRANCH],
+        "$defs": raw.get("$defs", {}),
     }
+    result = _strip_schema_noise(doc)
+    assert isinstance(result, dict)
+    return result
 
 
 # Advertised output schemas (convention: a discriminated ok:true|false union). Each
 # active tool advertises its own success shape so verdict/confidence appear only where
 # they are meaningful (review), not as perpetually-null fields on consult/delegate (#31).
-CONSULT_RESULT_SCHEMA = _object_union_schema(TypeAdapter(ConsultResult | ErrorResult))
-REVIEW_RESULT_SCHEMA = _object_union_schema(TypeAdapter(ReviewResult | ErrorResult))
-DELEGATE_RESULT_SCHEMA = _object_union_schema(TypeAdapter(DelegateResult | ErrorResult))
+# The error branch is a single fully-opaque branch (no $defs pollution, no dangling
+# refs); the full error contract lives at resource codex://error-envelope.
+CONSULT_RESULT_SCHEMA = published_schema(ConsultResult)
+REVIEW_RESULT_SCHEMA = published_schema(ReviewResult)
+DELEGATE_RESULT_SCHEMA = published_schema(DelegateResult)
 # codex_job_result / codex_job_consume_result serve every async kind, so their result
 # may be any of the three success envelopes (or an error). Branch on `ok`, then `tool`.
-JOB_RESULT_SCHEMA = _object_union_schema(
-    TypeAdapter(DelegateResult | ConsultResult | ReviewResult | ErrorResult)
-)
+JOB_RESULT_SCHEMA = published_schema(DelegateResult, ConsultResult, ReviewResult)
 # These three tools return their success model on the happy path, but an invalid
 # argument is re-emitted as an ErrorResult at the call-tool boundary (#136), so each
 # advertises a success|error union — otherwise that envelope would violate the
 # declared output schema for strict MCP clients.
-STATUS_SCHEMA = _object_union_schema(TypeAdapter(StatusResult | ErrorResult))
-CAPABILITIES_SCHEMA = _object_union_schema(TypeAdapter(CapabilitiesResult | ErrorResult))
-MODEL_CATALOG_SCHEMA = _object_union_schema(TypeAdapter(ModelCatalogResult | ErrorResult))
+STATUS_SCHEMA = published_schema(StatusResult)
+CAPABILITIES_SCHEMA = published_schema(CapabilitiesResult)
+MODEL_CATALOG_SCHEMA = published_schema(ModelCatalogResult)
 # codex_delegate_async returns only a job handle (or an error) — the eventual delegate
 # result is fetched separately via codex_job_result (DELEGATE_RESULT_SCHEMA).
-JOB_STARTED_SCHEMA = _object_union_schema(TypeAdapter(JobStarted | ErrorResult))
-JOB_STATUS_SCHEMA = _object_union_schema(TypeAdapter(JobStatus | ErrorResult))
-DRY_RUN_SCHEMA = _object_union_schema(TypeAdapter(DryRunResult | ErrorResult))
-DELEGATE_DRY_RUN_SCHEMA = _object_union_schema(TypeAdapter(DelegateDryRunResult | ErrorResult))
-JOB_LIST_SCHEMA = _object_union_schema(TypeAdapter(JobListResult | ErrorResult))
+JOB_STARTED_SCHEMA = published_schema(JobStarted)
+JOB_STATUS_SCHEMA = published_schema(JobStatus)
+DRY_RUN_SCHEMA = published_schema(DryRunResult)
+DELEGATE_DRY_RUN_SCHEMA = published_schema(DelegateDryRunResult)
+JOB_LIST_SCHEMA = published_schema(JobListResult)
+
+
+def _harden_error_envelope_schema(schema: dict) -> dict:  # type: ignore[type-arg]
+    """Post-process the raw Pydantic-generated ErrorResult schema to encode invariants
+    that Pydantic models enforce at runtime but that JSON Schema cannot express without
+    explicit work.
+
+    1. Ensures top-level ``required`` includes ``"ok"`` — Pydantic omits it because
+       ``ok`` carries a ``default`` of ``False``.
+    2. Encodes the model invariant ``temporary == False ⇒ retry_after_ms is None``
+       inside the ``ErrorInfo`` $def via a JSON Schema ``if/then`` conditional.
+
+    Operates on a deep copy to avoid mutating Pydantic's cached output in place.
+    """
+
+    s = copy.deepcopy(schema)
+    s["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    # 1. Require ok at the root.
+    required = s.setdefault("required", [])
+    if "ok" not in required:
+        required.append("ok")
+    # 2. Encode the temporary=False ⇒ retry_after_ms=null invariant in ErrorInfo.
+    error_def = s["$defs"]["ErrorInfo"]
+    error_def["if"] = {"properties": {"temporary": {"const": False}}, "required": ["temporary"]}
+    error_def["then"] = {"properties": {"retry_after_ms": {"const": None}}}
+    return s
+
+
+# The full error envelope, published once (resource codex://error-envelope). Root is the
+# outer ErrorResult (ok/error/meta) with all $defs — the canonical, discoverable contract.
+ERROR_ENVELOPE_SCHEMA = _harden_error_envelope_schema(
+    TypeAdapter(ErrorResult).json_schema(ref_template="#/$defs/{model}")
+)
 
 # JSON Schema enforced on Codex's final response for structured findings (passed via
 # `codex exec --output-schema FILE`). It mirrors the agent-visible result fields we
