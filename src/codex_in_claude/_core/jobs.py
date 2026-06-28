@@ -475,8 +475,21 @@ class JobStore:
                 "terminal_status": None,
                 "extra": extra or {},
             }
-            self._write_meta(jd, meta)
-            self._enforce_count_cap(cwd)
+            try:
+                self._write_meta(jd, meta)
+                self._enforce_count_cap(cwd)
+            except BaseException:
+                # Persistence failed after a successful spawn (disk full, fs error). A paid
+                # worker is already running detached; reap its process group so no orphaned
+                # worker survives — mirrors the `except OSError` around Popen above.
+                _terminate_pid_tree(proc.pid, self.terminate_grace_seconds)
+                # The worker may have already registered an external worktree in cleanup.json
+                # before being killed (and a SIGKILLed worker can't self-clean), so run the
+                # guarded external-path cleanup *before* dropping the job dir — otherwise
+                # deleting jd destroys the only manifest and leaks that worktree.
+                self._cleanup_external_paths(self._read_cleanup_manifest(jd))
+                shutil.rmtree(jd, ignore_errors=True)
+                raise
             return job_id, meta["started_at"]
 
     # ------------------------------------------------------------ status calc
