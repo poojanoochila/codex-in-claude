@@ -22,7 +22,7 @@ from codex_in_claude._core.jobs import DEFAULT_POLL_AFTER_MS
 # the fixture in the same commit. It is an acknowledgment guard — it surfaces the
 # drift, it does not mechanically force the integer bump (the snapshot and this
 # string are independently editable).
-FINGERPRINT = "codex-in-claude/0.1/schema-18"
+FINGERPRINT = "codex-in-claude/0.1/schema-19"
 
 # Default poll/backoff interval (ms) shared by job handles and the job_running
 # error's retry_after_ms, so the "when to retry" hint stays consistent in one place.
@@ -212,7 +212,9 @@ class RateLimitWindow(BaseModel):
     used_percent: float | None = None
     remaining_percent: float | None = None  # max(0, 100 - used_percent); None if reset_passed
     window_minutes: int | None = None
-    resets_at: int | None = None  # epoch seconds
+    # RFC3339 UTC (F6, schema-19); null when the captured epoch is absent or not
+    # datetime-representable — conversion never raises (tolerant parsing).
+    resets_at: str | None = None
     seconds_until_reset: int | None = None  # clamped ≥ 0; 0 when reset_passed; None if no resets_at
     reset_passed: bool = False
 
@@ -496,7 +498,8 @@ class AsyncLifecycle(BaseModel):
     Activity signal: the server exposes a polled (disk-persisted, poll-read) event-activity
     signal via `activity_support`/`event_count_field`/`last_event_field`/`event_age_field`.
     This is SEPARATE from `progress_support` — progress_support denotes native MCP
-    notifications/progress (which this server does not provide), and stays "none"."""
+    notifications/progress on THIS async/poll path, which has none (the sync await path
+    streams throttled notifications/progress instead), and stays "none"."""
 
     model_config = ConfigDict(extra="forbid")
     # No native MCP task object and no notifications/progress streaming — the run is
@@ -821,9 +824,34 @@ def published_schema(*success_models: type[BaseModel]) -> dict:  # type: ignore[
 CONSULT_RESULT_SCHEMA = published_schema(ConsultResult)
 REVIEW_RESULT_SCHEMA = published_schema(ReviewResult)
 DELEGATE_RESULT_SCHEMA = published_schema(DelegateResult)
-# codex_job_result / codex_job_consume_result serve every async kind, so their result
-# may be any of the three success envelopes (or an error). Branch on `ok`, then `tool`.
-JOB_RESULT_SCHEMA = published_schema(DelegateResult, ConsultResult, ReviewResult)
+# codex_job_result/_consume_result return exactly the envelope the originating tool
+# produced. Advertising the full three-model union re-embedded ~14.6KB of $defs on BOTH
+# tools (audit F1); instead the success branch is opaque and points at the originating
+# tool's advertised outputSchema, which the client has already loaded. Payloads are
+# validated against the real model server-side (_validate_job_success) before return.
+_OPAQUE_JOB_SUCCESS_BRANCH = {
+    "type": "object",
+    "required": ["ok", "tool"],
+    "properties": {
+        "ok": {"const": True},
+        "tool": {
+            "enum": ["codex_consult", "codex_review_changes", "codex_delegate"],
+            "description": (
+                "Originating tool; the payload matches that tool's advertised "
+                "outputSchema success branch — branch on this field."
+            ),
+        },
+    },
+}
+JOB_RESULT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "ok": {"type": "boolean", "description": "true = success result, false = error result"},
+    },
+    "required": ["ok"],
+    "anyOf": [_OPAQUE_JOB_SUCCESS_BRANCH, _OPAQUE_ERROR_BRANCH],
+    "$defs": {},
+}
 # These three tools return their success model on the happy path, but an invalid
 # argument is re-emitted as an ErrorResult at the call-tool boundary (#136), so each
 # advertises a success|error union — otherwise that envelope would violate the
