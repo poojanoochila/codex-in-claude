@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
@@ -22,7 +22,7 @@ from codex_in_claude._core.jobs import DEFAULT_POLL_AFTER_MS
 # the fixture in the same commit. It is an acknowledgment guard — it surfaces the
 # drift, it does not mechanically force the integer bump (the snapshot and this
 # string are independently editable).
-FINGERPRINT = "codex-in-claude/0.1/schema-22"
+FINGERPRINT = "codex-in-claude/0.1/schema-23"
 
 # Default poll/backoff interval (ms) shared by job handles and the job_running
 # error's retry_after_ms, so the "when to retry" hint stays consistent in one place.
@@ -454,12 +454,31 @@ class Repair(BaseModel):
 class ErrorDetail(BaseModel):
     """§6 details{field, value, reason}. `value` is deliberately omitted: a Literal/string
     param accepts arbitrary input that could be a secret, and best-effort redaction cannot
-    reliably catch a plain one; the caller already holds what it sent. Documented divergence."""
+    reliably catch a plain one; the caller already holds what it sent. Documented divergence.
+
+    `field` and `fields` are mutually exclusive — at most one is set, never both: `field`
+    names a single offending input; `fields` names a set of inputs whose *combination* is
+    invalid — e.g. a combined-size limit where no single input is at fault on its own
+    (#174/F2). Neither is required: a detail may instead carry only `reason`/`allowed_values`
+    (e.g. an enum failure with no single named field). When `fields` is set it is non-empty
+    and its entries are unique — both advertised in the published schema (`minItems: 1`,
+    `uniqueItems: true`), not merely runtime-enforced."""
 
     model_config = ConfigDict(extra="forbid")
     field: str | None = None
+    fields: (
+        Annotated[list[str], Field(min_length=1, json_schema_extra={"uniqueItems": True})] | None
+    ) = None
     reason: str | None = None
     allowed_values: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _one_of_field_or_fields(self) -> ErrorDetail:
+        if self.field is not None and self.fields is not None:
+            raise ValueError("ErrorDetail: set at most one of field/fields, never both")
+        if self.fields is not None and len(set(self.fields)) != len(self.fields):
+            raise ValueError("ErrorDetail.fields must not contain duplicates")
+        return self
 
 
 class ErrorInfo(BaseModel):
@@ -610,6 +629,13 @@ class CapabilitiesResult(BaseModel):
     negative_scope: list[str]  # what it deliberately does NOT do
     prerequisites: list[str]
     deprecation_policy: str
+    # Where a TOOL failure travels, stated before the first failure so a client need not
+    # infer it from the outputSchema union (#175/F3). Scoped to tool calls deliberately:
+    # resource-read failures use the JSON-RPC error carrier, not a tool result.
+    tool_error_carrier: str = (
+        "tool result with isError: true; the error envelope is in structuredContent, "
+        "and content[0].text mirrors it as JSON"
+    )
     error_envelope_resource: str = "codex://error-envelope"
     result_meta_resource: str = "codex://result-meta"
     # Opt-in tool-reachable fallback: the full error-envelope / result-meta schemas,
