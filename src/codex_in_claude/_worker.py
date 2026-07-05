@@ -197,15 +197,12 @@ def main(argv: list[str] | None = None) -> int:
         # down the worktree, and the JobStore owns the terminal status — leave no
         # result.json behind.
         return 0
-    except Exception as exc:
+except Exception as exc:
         payload = serialize_error(
             ErrorResult(
                 error=make_error(
                     "internal_error",
-                    (
-                        f"background worker crashed: {type(exc).__name__}: "
-                        f"{redaction.redact_text(str(exc)) or ''}"
-                    )[:300],
+                    f"background worker crashed: {redaction.exc_summary(exc)}"[:300],
                 ),
                 meta=_meta_from_spec(spec),
             )
