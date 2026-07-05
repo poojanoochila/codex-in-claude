@@ -87,6 +87,17 @@ def redact_text(text: str | None) -> str | None:
     return out
 
 
+def exc_summary(exc: BaseException) -> str:
+    """Format an exception as ``"{ClassName}: {redacted detail}"`` for client-visible
+    error messages, omitting the trailing ``": "`` when there is no detail to show
+    (``str(exc)`` is empty, or ``redact_text`` redacts it down to nothing). Centralizes
+    the composition rule so ``server.py`` and ``_worker.py`` don't each reimplement it
+    (see #203)."""
+    name = type(exc).__name__
+    detail = redact_text(str(exc))
+    return f"{name}: {detail}" if detail else name
+
+
 def redact_tree(value: object) -> object:
     """Deep-apply ``redact_text`` to every string *value* in a nested list/dict/str.
 
